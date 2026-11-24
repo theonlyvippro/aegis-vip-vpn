@@ -1,9 +1,11 @@
-// ... existing code ...
+package com.aegisvip.vpn
+
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -11,7 +13,162 @@ import androidx.core.app.NotificationCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Self-contained parsed VLESS configuration model so AegisVpnService compiles
+ * cleanly regardless of file ordering in the project.
+ */
+data class VlessNodeConfig(
+    val remark: String,
+    val uuid: String,
+    val address: String,
+    val port: Int,
+    val encryption: String = "none",
+    val network: String = "xhttp",
+    val host: String = "",
+    val headerType: String = "auto",
+    val path: String = "/",
+    val security: String = "tls",
+    val fingerprint: String = "chrome",
+    val sni: String = ""
+) {
+    fun toXrayOutboundJson(tag: String = "proxy"): JSONObject {
+        val effectiveSni = sni.ifBlank { host.ifBlank { address } }
+        val effectiveHost = host.ifBlank { effectiveSni }
+        val normalizedPath = if (path.startsWith("/")) path else "/$path"
+
+        val userObj = JSONObject().apply {
+            put("id", uuid)
+            put("encryption", encryption.ifBlank { "none" })
+            put("level", 0)
+        }
+
+        val vnextItem = JSONObject().apply {
+            put("address", address)
+            put("port", port)
+            put("users", JSONArray().put(userObj))
+        }
+
+        val settingsObj = JSONObject().apply {
+            put("vnext", JSONArray().put(vnextItem))
+        }
+
+        val streamSettings = JSONObject().apply {
+            put("network", network.ifBlank { "tcp" })
+            if (security.isNotBlank() && security != "none") {
+                put("security", security)
+            }
+
+            if (security.equals("tls", ignoreCase = true)) {
+                val tlsObj = JSONObject().apply {
+                    put("serverName", effectiveSni)
+                    if (fingerprint.isNotBlank()) {
+                        put("fingerprint", fingerprint)
+                    }
+                }
+                put("tlsSettings", tlsObj)
+            }
+
+            when (network.lowercase()) {
+                "xhttp" -> {
+                    val xhttpObj = JSONObject().apply {
+                        put("path", normalizedPath)
+                        if (effectiveHost.isNotBlank()) {
+                            put("host", effectiveHost)
+                        }
+                    }
+                    put("xhttpSettings", xhttpObj)
+                }
+                "ws" -> {
+                    val wsObj = JSONObject().apply {
+                        put("path", normalizedPath)
+                        if (effectiveHost.isNotBlank()) {
+                            put("headers", JSONObject().put("Host", effectiveHost))
+                        }
+                    }
+                    put("wsSettings", wsObj)
+                }
+            }
+        }
+
+        return JSONObject().apply {
+            put("tag", tag)
+            put("protocol", "vless")
+            put("settings", settingsObj)
+            put("streamSettings", streamSettings)
+        }
+    }
+
+    companion object {
+        fun parse(rawUri: String): VlessNodeConfig {
+            val trimmed = rawUri.trim()
+            if (trimmed.isEmpty()) {
+                throw IllegalArgumentException("VLESS URI cannot be empty")
+            }
+
+            val normalizedUri = if (trimmed.length >= 8 && trimmed.substring(0, 8).equals("vless://", ignoreCase = true)) {
+                "vless://" + trimmed.substring(8)
+            } else {
+                throw IllegalArgumentException("URI must start with vless://")
+            }
+
+            val hashIndex = normalizedUri.indexOf('#')
+            val withoutFragment = if (hashIndex >= 0) normalizedUri.substring(0, hashIndex) else normalizedUri
+            val rawFragment = if (hashIndex >= 0) normalizedUri.substring(hashIndex + 1) else ""
+
+            val decodedRemark = try {
+                if (rawFragment.isNotEmpty()) {
+                    URLDecoder.decode(rawFragment, StandardCharsets.UTF_8.name())
+                } else {
+                    ""
+                }
+            } catch (_: Exception) {
+                rawFragment
+            }
+
+            val parsed = Uri.parse(withoutFragment)
+            val uuid = parsed.userInfo?.trim().orEmpty()
+            val address = parsed.host?.trim().orEmpty()
+            val port = if (parsed.port in 1..65535) parsed.port else 443
+
+            if (uuid.isEmpty()) {
+                throw IllegalArgumentException("Missing UUID in VLESS URI")
+            }
+            if (address.isEmpty()) {
+                throw IllegalArgumentException("Missing server address in VLESS URI")
+            }
+
+            val encryption = parsed.getQueryParameter("encryption")?.trim().orEmpty().ifEmpty { "none" }
+            val network = parsed.getQueryParameter("type")?.trim().orEmpty().ifEmpty { "tcp" }
+            val host = parsed.getQueryParameter("host")?.trim().orEmpty()
+            val headerType = parsed.getQueryParameter("headerType")?.trim().orEmpty().ifEmpty { "auto" }
+            val rawPath = parsed.getQueryParameter("path")?.trim().orEmpty().ifEmpty { "/" }
+            val security = parsed.getQueryParameter("security")?.trim().orEmpty().ifEmpty { "none" }
+            val fingerprint = parsed.getQueryParameter("fp")?.trim().orEmpty()
+            val sni = parsed.getQueryParameter("sni")?.trim().orEmpty()
+
+            val finalRemark = decodedRemark.ifBlank { "$address:$port" }
+
+            return VlessNodeConfig(
+                remark = finalRemark,
+                uuid = uuid,
+                address = address,
+                port = port,
+                encryption = encryption,
+                network = network,
+                host = host,
+                headerType = headerType,
+                path = rawPath,
+                security = security,
+                fingerprint = fingerprint,
+                sni = sni
+            )
+        }
+    }
+}
 
 /**
  * Android VpnService that binds a local TUN interface and prepares VLESS node
@@ -43,7 +200,7 @@ class AegisVpnService : VpnService() {
         val fallbackServerName = intent?.getStringExtra(EXTRA_SERVER_NAME)?.trim().orEmpty()
         val rawVlessUri = intent?.getStringExtra(EXTRA_VLESS_URI)?.trim().orEmpty()
 
-        val parsedNode = if (rawVlessUri.isNotEmpty()) {
+        val parsedNode: VlessNodeConfig? = if (rawVlessUri.isNotEmpty()) {
             try {
                 VlessNodeConfig.parse(rawVlessUri)
             } catch (_: Exception) {
@@ -54,7 +211,7 @@ class AegisVpnService : VpnService() {
         }
 
         activeNode = parsedNode
-        val sessionTitle = parsedNode?.remark?.ifBlank { null }
+        val sessionTitle: String = parsedNode?.remark?.takeIf { it.isNotBlank() }
             ?: fallbackServerName.ifBlank { "AegisVIP Node" }
 
         startForegroundCompat(sessionTitle, parsedNode)
@@ -62,10 +219,6 @@ class AegisVpnService : VpnService() {
         return START_STICKY
     }
 
-    /**
-     * Builds a full Xray client JSON config using [VlessNodeConfig.toXrayOutboundJson]
-     * and writes it to `filesDir/xray_active_config.json` so a native Xray core can read it.
-     */
     private fun writeXrayClientConfig(node: VlessNodeConfig): File? {
         return try {
             val socksInbound = JSONObject().apply {
@@ -107,7 +260,6 @@ class AegisVpnService : VpnService() {
     }
 
     private fun startVpnTunnel(sessionName: String, node: VlessNodeConfig?) {
-        // Restart cleanly if already running with a different node
         if (isRunning.get()) {
             stopVpnTunnel()
         }
@@ -124,14 +276,11 @@ class AegisVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .setMtu(1400)
 
-            // Avoid routing loop if connecting directly to the remote VPN server IP
-            node?.address?.takeIf { it.isNotBlank() }?.let { addr ->
+            node?.let {
                 try {
                     builder.addDisallowedApplication(packageName)
                 } catch (_: Exception) {
                 }
-                // Keep route exclusions optional; DNS & tunnel setup remain active
-                val _targetHost = addr
             }
 
             val pfd = builder.establish()
@@ -145,7 +294,6 @@ class AegisVpnService : VpnService() {
                 try {
                     runTunnelCore(pfd, node, configFile)
                 } catch (_: Exception) {
-                    // Ensure loop exits safely on error
                 } finally {
                     if (isRunning.get()) {
                         stopVpnTunnel()
@@ -160,10 +308,6 @@ class AegisVpnService : VpnService() {
         }
     }
 
-    /**
-     * Hook point where your Xray/sing-box library or tun2socks binary reads [configFile]
-     * and forwards packets across [tunFd].
-     */
     private fun runTunnelCore(tunFd: ParcelFileDescriptor, node: VlessNodeConfig?, configFile: File?) {
         val _fd = tunFd.fd
         val _node = node
@@ -233,7 +377,6 @@ class AegisVpnService : VpnService() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (_: Exception) {
-            // Fallback silently if foreground notification permission is restricted
         }
     }
 
@@ -272,4 +415,3 @@ class AegisVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1001
     }
 }
-// ... existing code ...
