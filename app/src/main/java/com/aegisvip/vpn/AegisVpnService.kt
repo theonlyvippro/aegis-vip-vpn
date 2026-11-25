@@ -1,386 +1,208 @@
-package com.aegisvip.vpn
+package com.aegisvpn.vip
 
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
-import android.content.pm.ServiceInfo
-import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.core.app.NotificationCompat
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
-import java.net.URLDecoder
-import java.nio.charset.StandardCharsets
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.InetSocketAddress
+import java.nio.ByteBuffer
+import java.nio.channels.DatagramChannel
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Self-contained parsed VLESS configuration model so AegisVpnService compiles
- * cleanly regardless of file ordering in the project.
- */
-data class VlessNodeConfig(
-    val remark: String,
-    val uuid: String,
-    val address: String,
-    val port: Int,
-    val encryption: String = "none",
-    val network: String = "xhttp",
-    val host: String = "",
-    val headerType: String = "auto",
-    val path: String = "/",
-    val security: String = "tls",
-    val fingerprint: String = "chrome",
-    val sni: String = ""
-) {
-    fun toXrayOutboundJson(tag: String = "proxy"): JSONObject {
-        val effectiveSni = sni.ifBlank { host.ifBlank { address } }
-        val effectiveHost = host.ifBlank { effectiveSni }
-        val normalizedPath = if (path.startsWith("/")) path else "/$path"
-
-        val userObj = JSONObject().apply {
-            put("id", uuid)
-            put("encryption", encryption.ifBlank { "none" })
-            put("level", 0)
-        }
-
-        val vnextItem = JSONObject().apply {
-            put("address", address)
-            put("port", port)
-            put("users", JSONArray().put(userObj))
-        }
-
-        val settingsObj = JSONObject().apply {
-            put("vnext", JSONArray().put(vnextItem))
-        }
-
-        val streamSettings = JSONObject().apply {
-            put("network", network.ifBlank { "tcp" })
-            if (security.isNotBlank() && security != "none") {
-                put("security", security)
-            }
-
-            if (security.equals("tls", ignoreCase = true)) {
-                val tlsObj = JSONObject().apply {
-                    put("serverName", effectiveSni)
-                    if (fingerprint.isNotBlank()) {
-                        put("fingerprint", fingerprint)
-                    }
-                }
-                put("tlsSettings", tlsObj)
-            }
-
-            when (network.lowercase()) {
-                "xhttp" -> {
-                    val xhttpObj = JSONObject().apply {
-                        put("path", normalizedPath)
-                        if (effectiveHost.isNotBlank()) {
-                            put("host", effectiveHost)
-                        }
-                    }
-                    put("xhttpSettings", xhttpObj)
-                }
-                "ws" -> {
-                    val wsObj = JSONObject().apply {
-                        put("path", normalizedPath)
-                        if (effectiveHost.isNotBlank()) {
-                            put("headers", JSONObject().put("Host", effectiveHost))
-                        }
-                    }
-                    put("wsSettings", wsObj)
-                }
-            }
-        }
-
-        return JSONObject().apply {
-            put("tag", tag)
-            put("protocol", "vless")
-            put("settings", settingsObj)
-            put("streamSettings", streamSettings)
-        }
-    }
-
-    companion object {
-        fun parse(rawUri: String): VlessNodeConfig {
-            val trimmed = rawUri.trim()
-            if (trimmed.isEmpty()) {
-                throw IllegalArgumentException("VLESS URI cannot be empty")
-            }
-
-            val normalizedUri = if (trimmed.length >= 8 && trimmed.substring(0, 8).equals("vless://", ignoreCase = true)) {
-                "vless://" + trimmed.substring(8)
-            } else {
-                throw IllegalArgumentException("URI must start with vless://")
-            }
-
-            val hashIndex = normalizedUri.indexOf('#')
-            val withoutFragment = if (hashIndex >= 0) normalizedUri.substring(0, hashIndex) else normalizedUri
-            val rawFragment = if (hashIndex >= 0) normalizedUri.substring(hashIndex + 1) else ""
-
-            val decodedRemark = try {
-                if (rawFragment.isNotEmpty()) {
-                    URLDecoder.decode(rawFragment, StandardCharsets.UTF_8.name())
-                } else {
-                    ""
-                }
-            } catch (_: Exception) {
-                rawFragment
-            }
-
-            val parsed = Uri.parse(withoutFragment)
-            val uuid = parsed.userInfo?.trim().orEmpty()
-            val address = parsed.host?.trim().orEmpty()
-            val port = if (parsed.port in 1..65535) parsed.port else 443
-
-            if (uuid.isEmpty()) {
-                throw IllegalArgumentException("Missing UUID in VLESS URI")
-            }
-            if (address.isEmpty()) {
-                throw IllegalArgumentException("Missing server address in VLESS URI")
-            }
-
-            val encryption = parsed.getQueryParameter("encryption")?.trim().orEmpty().ifEmpty { "none" }
-            val network = parsed.getQueryParameter("type")?.trim().orEmpty().ifEmpty { "tcp" }
-            val host = parsed.getQueryParameter("host")?.trim().orEmpty()
-            val headerType = parsed.getQueryParameter("headerType")?.trim().orEmpty().ifEmpty { "auto" }
-            val rawPath = parsed.getQueryParameter("path")?.trim().orEmpty().ifEmpty { "/" }
-            val security = parsed.getQueryParameter("security")?.trim().orEmpty().ifEmpty { "none" }
-            val fingerprint = parsed.getQueryParameter("fp")?.trim().orEmpty()
-            val sni = parsed.getQueryParameter("sni")?.trim().orEmpty()
-
-            val finalRemark = decodedRemark.ifBlank { "$address:$port" }
-
-            return VlessNodeConfig(
-                remark = finalRemark,
-                uuid = uuid,
-                address = address,
-                port = port,
-                encryption = encryption,
-                network = network,
-                host = host,
-                headerType = headerType,
-                path = rawPath,
-                security = security,
-                fingerprint = fingerprint,
-                sni = sni
-            )
-        }
-    }
-}
-
-/**
- * Android VpnService that binds a local TUN interface and prepares VLESS node
- * configuration (via [VlessNodeConfig]) for an underlying Xray/tunnel core.
+ * AegisVpnService កូនកាត់ពី android.net.VpnService
+ * ការបង្កើត TUN interface តាមរយៈ VpnService.Builder.establish()
+ * នឹងធ្វើឱ្យប្រព័ន្ធ Android លោតសញ្ញា "VPN" នៅលើ Status Bar ខាងលើ
+ * និងបង្ហាញ Notification ពេលកំពុងដំណើរការ។
  */
 class AegisVpnService : VpnService() {
+
+    companion object {
+        private const val TAG = "AegisVpnService"
+        private const val CHANNEL_ID = "aegis_vpn_channel"
+        private const val NOTIFICATION_ID = 1001
+
+        const val ACTION_CONNECT = "com.aegisvpn.vip.action.CONNECT"
+        const val ACTION_DISCONNECT = "com.aegisvpn.vip.action.DISCONNECT"
+        const val ACTION_VPN_STATE_CHANGED = "com.aegisvpn.vip.action.STATE_CHANGED"
+        const val EXTRA_IS_CONNECTED = "extra_is_connected"
+        const val EXTRA_SERVER_NAME = "extra_server_name"
+    }
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tunnelThread: Thread? = null
     private val isRunning = AtomicBoolean(false)
-
-    @Volatile
-    private var activeNode: VlessNodeConfig? = null
+    private var activeServerName: String = "វៀតណាម • ហូជីមិញ VIP"
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        try {
+            createNotificationChannel()
+        } catch (ex: Exception) {
+            Log.e(TAG, "កំហុសពេលបង្កើត Notification Channel", ex)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_START
-        if (action == ACTION_STOP) {
-            stopVpnTunnel()
-            stopForegroundCompat()
+        try {
+            when (intent?.action) {
+                ACTION_DISCONNECT -> {
+                    stopVpnTunnel()
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                ACTION_CONNECT, null -> {
+                    activeServerName = intent?.getStringExtra(MainActivity.EXTRA_SERVER_NAME)
+                        ?: activeServerName
+                    val serverUri = intent?.getStringExtra(MainActivity.EXTRA_SERVER_URI) ?: ""
+                    val protocol = intent?.getStringExtra(MainActivity.EXTRA_PROTOCOL) ?: "OpenVPN SSH"
+
+                    startForeground(NOTIFICATION_ID, buildStatusNotification(activeServerName, protocol))
+                    startVpnTunnel(serverUri, protocol)
+                    return START_STICKY
+                }
+            }
+        } catch (ex: Exception) {
+            Log.e(TAG, "កំហុសក្នុង onStartCommand", ex)
+            broadcastState(connected = false)
             stopSelf()
-            return START_NOT_STICKY
         }
-
-        val fallbackServerName = intent?.getStringExtra(EXTRA_SERVER_NAME)?.trim().orEmpty()
-        val rawVlessUri = intent?.getStringExtra(EXTRA_VLESS_URI)?.trim().orEmpty()
-
-        val parsedNode: VlessNodeConfig? = if (rawVlessUri.isNotEmpty()) {
-            try {
-                VlessNodeConfig.parse(rawVlessUri)
-            } catch (_: Exception) {
-                null
-            }
-        } else {
-            null
-        }
-
-        activeNode = parsedNode
-        val sessionTitle: String = parsedNode?.remark?.takeIf { it.isNotBlank() }
-            ?: fallbackServerName.ifBlank { "AegisVIP Node" }
-
-        startForegroundCompat(sessionTitle, parsedNode)
-        startVpnTunnel(sessionTitle, parsedNode)
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
-    private fun writeXrayClientConfig(node: VlessNodeConfig): File? {
-        return try {
-            val socksInbound = JSONObject().apply {
-                put("tag", "socks-in")
-                put("port", 10808)
-                put("listen", "127.0.0.1")
-                put("protocol", "socks")
-                put(
-                    "settings",
-                    JSONObject().apply {
-                        put("auth", "noauth")
-                        put("udp", true)
-                    }
-                )
-            }
-
-            val directOutbound = JSONObject().apply {
-                put("tag", "direct")
-                put("protocol", "freedom")
-            }
-
-            val fullConfig = JSONObject().apply {
-                put("log", JSONObject().put("loglevel", "warning"))
-                put("inbounds", JSONArray().put(socksInbound))
-                put(
-                    "outbounds",
-                    JSONArray()
-                        .put(node.toXrayOutboundJson("proxy"))
-                        .put(directOutbound)
-                )
-            }
-
-            val configFile = File(filesDir, "xray_active_config.json")
-            configFile.writeText(fullConfig.toString(2), Charsets.UTF_8)
-            configFile
-        } catch (_: Exception) {
-            null
-        }
+    override fun onRevoke() {
+        // ត្រូវបានហៅនៅពេលប្រព័ន្ធ Android ឬកម្មវិធី VPN ផ្សេងទៀតដកសិទ្ធិ VPN
+        Log.w(TAG, "សិទ្ធិ VPN ត្រូវបានដកហូត (onRevoke)")
+        stopVpnTunnel()
+        super.onRevoke()
     }
 
-    private fun startVpnTunnel(sessionName: String, node: VlessNodeConfig?) {
+    override fun onDestroy() {
+        stopVpnTunnel()
+        super.onDestroy()
+    }
+
+    /**
+     * បង្កើត TUN Interface តាមរយៈ VpnService.Builder
+     * ដើម្បីឱ្យសញ្ញា VPN លោតនៅលើ Status Bar របស់ទូរស័ព្ទ។
+     */
+    private fun startVpnTunnel(serverUri: String, protocol: String) {
         if (isRunning.get()) {
             stopVpnTunnel()
         }
-        isRunning.set(true)
 
         try {
-            val configFile = if (node != null) writeXrayClientConfig(node) else null
+            Log.i(TAG, "កំពុងរៀបចំ Tunnel ($protocol): $serverUri")
 
             val builder = Builder()
-                .setSession(sessionName)
-                .addAddress("10.8.0.2", 24)
+                .setSession("AegisVPN VIP ($activeServerName)")
+                .setMtu(1400)
+                .addAddress("10.66.0.2", 24)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
-                .setMtu(1400)
 
-            node?.let {
-                try {
-                    builder.addDisallowedApplication(packageName)
-                } catch (_: Exception) {
-                }
-            }
+            // ការពារ Socket របស់កម្មវិធីខ្លួនឯងកុំឱ្យរត់ចូល Loop ក្នុង TUN
+            val udpSocket = DatagramChannel.open()
+            udpSocket.socket().bind(null)
+            protect(udpSocket.socket())
 
-            val pfd = builder.establish()
-            if (pfd == null) {
-                stopVpnTunnel()
+            val establishedInterface = builder.establish()
+            if (establishedInterface == null) {
+                Log.e(TAG, "មិនអាចបង្កើត TUN Interface បានទេ (establish() ត្រឡប់ null)")
+                udpSocket.close()
+                broadcastState(connected = false)
                 return
             }
-            vpnInterface = pfd
+
+            vpnInterface = establishedInterface
+            isRunning.set(true)
+            broadcastState(connected = true)
 
             tunnelThread = Thread({
-                try {
-                    runTunnelCore(pfd, node, configFile)
-                } catch (_: Exception) {
-                } finally {
-                    if (isRunning.get()) {
-                        stopVpnTunnel()
-                    }
-                }
+                runPacketLoop(establishedInterface, udpSocket)
             }, "AegisVpnTunnelThread").apply {
                 isDaemon = true
                 start()
             }
-        } catch (_: Exception) {
+
+            Log.i(TAG, "TUN Interface បានបើកដំណើរការជោគជ័យ!")
+        } catch (ex: Exception) {
+            Log.e(TAG, "កំហុសពេលបង្កើត VPN Tunnel", ex)
             stopVpnTunnel()
+            broadcastState(connected = false)
         }
     }
 
-    private fun runTunnelCore(tunFd: ParcelFileDescriptor, node: VlessNodeConfig?, configFile: File?) {
-        val _fd = tunFd.fd
-        val _node = node
-        val _cfg = configFile
+    /**
+     * រង្វិលជុំអាន Packet ពី TUN Interface
+     * (នៅកន្លែងនេះអ្នកអាចភ្ជាប់ទៅកាន់ Core ពិតប្រាកដដូចជា sing-box / xray / openvpn / ssh)
+     */
+    private fun runPacketLoop(tunFd: ParcelFileDescriptor, udpSocket: DatagramChannel) {
+        try {
+            val inputStream = FileInputStream(tunFd.fileDescriptor)
+            val outputStream = FileOutputStream(tunFd.fileDescriptor)
+            val packetBuffer = ByteBuffer.allocate(32767)
+            val dnsTarget = InetSocketAddress("1.1.1.1", 53)
 
-        while (isRunning.get() && !Thread.currentThread().isInterrupted) {
+            while (isRunning.get() && !Thread.currentThread().isInterrupted) {
+                val length = inputStream.read(packetBuffer.array())
+                if (length > 0) {
+                    // ត្រួតពិនិត្យ Packet ដំបូង (IPv4 header)
+                    val firstByte = packetBuffer.array()[0].toInt() and 0xFF
+                    if (firstByte ushr 4 == 4 && length >= 28) {
+                        // ឧទាហរណ៍បញ្ជូន UDP DNS ទៅកាន់ 1.1.1.1 តាម Socket ដែលបាន protect()
+                        val protocolByte = packetBuffer.array()[9].toInt() and 0xFF
+                        if (protocolByte == 17) {
+                            val payloadOffset = 28
+                            val payloadLen = length - payloadOffset
+                            if (payloadLen > 0) {
+                                val outBuf = ByteBuffer.wrap(packetBuffer.array(), payloadOffset, payloadLen)
+                                udpSocket.send(outBuf, dnsTarget)
+                            }
+                        }
+                    }
+                    // រក្សាលំហូរសុវត្ថិភាព និងអាចសរសេរ Packet ត្រឡប់តាម outputStream ពេលភ្ជាប់ Core ពេញលេញ
+                    outputStream.write(0)
+                } else {
+                    Thread.sleep(25)
+                }
+            }
+        } catch (_: InterruptedException) {
+            // បញ្ឈប់ Thread ដោយសុវត្ថិភាព
+        } catch (ex: Exception) {
+            if (isRunning.get()) {
+                Log.e(TAG, "កំហុសក្នុង Packet Loop", ex)
+            }
+        } finally {
             try {
-                Thread.sleep(1000)
-            } catch (_: InterruptedException) {
-                break
+                udpSocket.close()
+            } catch (_: Exception) {
             }
         }
     }
 
     private fun stopVpnTunnel() {
         isRunning.set(false)
-        activeNode = null
-        tunnelThread?.interrupt()
-        tunnelThread = null
+        try {
+            tunnelThread?.interrupt()
+            tunnelThread = null
+        } catch (_: Exception) {
+        }
         try {
             vpnInterface?.close()
-        } catch (_: Exception) {
-        } finally {
             vpnInterface = null
+        } catch (ex: Exception) {
+            Log.e(TAG, "កំហុសពេលបិទ TUN Interface", ex)
         }
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "AegisVIP VPN Tunnel",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Active VPN tunnel status"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(title: String, node: VlessNodeConfig?): Notification {
-        val contentText = if (node != null) {
-            "${node.network.uppercase()} • ${node.address}:${node.port}"
-        } else {
-            "VPN tunnel active"
-        }
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentTitle(title)
-            .setContentText(contentText)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun startForegroundCompat(title: String, node: VlessNodeConfig?) {
-        try {
-            val notification = buildNotification(title, node)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun stopForegroundCompat() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -390,28 +212,47 @@ class AegisVpnService : VpnService() {
             }
         } catch (_: Exception) {
         }
+        broadcastState(connected = false)
     }
 
-    override fun onDestroy() {
-        stopVpnTunnel()
-        stopForegroundCompat()
-        super.onDestroy()
+    private fun broadcastState(connected: Boolean) {
+        val stateIntent = Intent(ACTION_VPN_STATE_CHANGED).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_IS_CONNECTED, connected)
+            putExtra(EXTRA_SERVER_NAME, activeServerName)
+        }
+        sendBroadcast(stateIntent)
     }
 
-    override fun onRevoke() {
-        stopVpnTunnel()
-        stopForegroundCompat()
-        stopSelf()
-        super.onRevoke()
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "AegisVPN VIP Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "បង្ហាញស្ថានភាពការតភ្ជាប់ VPN នៅលើទូរស័ព្ទ"
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
     }
 
-    companion object {
-        const val ACTION_START = "com.aegisvip.vpn.action.START"
-        const val ACTION_STOP = "com.aegisvip.vpn.action.STOP"
-        const val EXTRA_SERVER_NAME = "com.aegisvip.vpn.extra.SERVER_NAME"
-        const val EXTRA_VLESS_URI = "com.aegisvip.vpn.extra.VLESS_URI"
+    private fun buildStatusNotification(serverName: String, protocol: String): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java)
+        val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val contentIntent = PendingIntent.getActivity(this, 0, openAppIntent, pendingIntentFlags)
 
-        private const val CHANNEL_ID = "aegisvip_vpn_channel"
-        private const val NOTIFICATION_ID = 1001
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("AegisVPN VIP • បានភ្ជាប់")
+            .setContentText("$serverName ($protocol)")
+            .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+            .setContentIntent(contentIntent)
+            .setOngoing(true)
+            .build()
     }
 }
