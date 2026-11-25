@@ -1,4 +1,5 @@
-package com.aegisvpn.vip
+package com.aegisvip.vpn
+
 
 import android.app.Notification
 import android.app.NotificationChannel
